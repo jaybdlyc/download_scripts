@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Weibo Album Bulk Downloader
+// @name         一键批量下载微博相册中的全部图片与 LivePhoto 视频
 // @namespace    local.weibo.album.bulk.downloader
 // @version      1.1.0
 // @description  一键批量下载微博相册中的全部图片与 LivePhoto 视频（文件夹模式）
