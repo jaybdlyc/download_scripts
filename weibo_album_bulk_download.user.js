@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         一键批量下载微博相册中的全部图片与 LivePhoto 视频
 // @namespace    local.weibo.album.bulk.downloader
-// @version      1.1.0
+// @version      1.1.1
 // @description  一键批量下载微博相册中的全部图片与 LivePhoto 视频（文件夹模式）
 // @match        https://weibo.com/u/*
+// @match        https://weibo.com/n/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
@@ -195,15 +196,21 @@
         stoppedByUser = true;
         return;
       }
+      const uid = await ensureUid(pageInfo);
+      if (!uid) {
+        setStatus('无法识别当前用户 ID，请先打开用户主页后重试');
+        return;
+      }
+
       currentDirHandle = dirHandle;
-      currentTargetDirHandle = await prepareUserSubDirectory(currentDirHandle, pageInfo.uid);
+      currentTargetDirHandle = await prepareUserSubDirectory(currentDirHandle, uid);
       if (!currentTargetDirHandle) {
         setStatus('无法创建用户子目录');
         return;
       }
 
       setStatus('开始抓取媒体列表...');
-      await produceMediaList(pageInfo.uid);
+      await produceMediaList(uid);
       if (stopFlag) {
         stoppedByUser = true;
         return;
@@ -287,16 +294,38 @@
     } catch (_) {
       return null;
     }
-    const m = u.pathname.match(/^\/u\/(\d+)\/?$/);
-    if (!m) return null;
+    const uidMatch = u.pathname.match(/^\/u\/(\d+)\/?$/);
+    const customMatch = u.pathname.match(/^\/n\/([^/?#]+)\/?$/);
+    if (!uidMatch && !customMatch) return null;
     return {
-      uid: m[1],
+      uid: uidMatch ? uidMatch[1] : '',
+      custom: customMatch ? decodePathSegment(customMatch[1]) : '',
       tabtype: u.searchParams.get('tabtype') || ''
     };
   }
 
   function isAlbumPage(info) {
-    return !!(info && info.uid && info.tabtype === 'album');
+    return !!(info && (info.uid || info.custom) && info.tabtype === 'album');
+  }
+
+  function decodePathSegment(segment) {
+    try {
+      return decodeURIComponent(String(segment || ''));
+    } catch (_) {
+      return String(segment || '');
+    }
+  }
+
+  async function ensureUid(pageInfo) {
+    if (!pageInfo) return '';
+    if (pageInfo.uid) return String(pageInfo.uid);
+    if (!pageInfo.custom) return '';
+    try {
+      const profile = await fetchProfileInfoByCustom(pageInfo.custom);
+      return String((profile && profile.idstr) || (profile && profile.id) || '');
+    } catch (_) {
+      return '';
+    }
   }
 
   function setUiVisible(visible) {
@@ -1183,6 +1212,24 @@
       return json.data.user;
     } catch (err) {
       console.warn('[weibo-bulk] fetch profile info failed:', err);
+      return null;
+    }
+  }
+
+  async function fetchProfileInfoByCustom(custom) {
+    const url = `https://weibo.com/ajax/profile/info?custom=${encodeURIComponent(custom)}`;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*' }
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      if (!json || Number(json.ok) !== 1 || !json.data || !json.data.user) return null;
+      return json.data.user;
+    } catch (err) {
+      console.warn('[weibo-bulk] fetch profile by custom failed:', err);
       return null;
     }
   }
