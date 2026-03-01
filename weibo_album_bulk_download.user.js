@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         一键批量下载微博相册中的全部图片与 LivePhoto 视频
 // @namespace    local.weibo.album.bulk.downloader
-// @version      1.1.0
+// @version      1.1.1
 // @description  一键批量下载微博相册中的全部图片与 LivePhoto 视频（文件夹模式）
 // @match        https://weibo.com/u/*
+// @match        https://weibo.com/n/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
@@ -43,6 +44,7 @@
   let activeDownloads = 0;
   const queue = [];
   const seen = new Set();
+  const failedTasks = [];
   let finishResolver = null;
   let finishPromise = null;
   let currentDirHandle = null;
@@ -75,6 +77,7 @@
     activeDownloads = 0;
     queue.length = 0;
     seen.clear();
+    failedTasks.length = 0;
     currentTargetDirHandle = null;
     fetchInFlight = false;
     inFlightSinceIds.clear();
@@ -91,13 +94,23 @@
   }
 
   function refreshControlButtons() {
-    if (!ui.mainBtn || !ui.pauseBtn) return;
-    ui.mainBtn.textContent = isRunning ? '停止下载' : '开始下载';
-    ui.mainBtn.style.background = isRunning ? '#d14343' : '#1677ff';
-    ui.pauseBtn.disabled = !isRunning;
-    ui.pauseBtn.textContent = isPaused ? '继续' : '暂停';
-    ui.pauseBtn.style.opacity = ui.pauseBtn.disabled ? '0.6' : '1';
-    ui.pauseBtn.style.cursor = ui.pauseBtn.disabled ? 'not-allowed' : 'pointer';
+    // mainBtn must exist; stopBtn is optional (created later)
+    if (!ui.mainBtn) return;
+    // main button toggles between start / pause / continue
+    ui.mainBtn.textContent = !isRunning ? '开始下载' : (isPaused ? '继续' : '暂停');
+    if (!isRunning) {
+      ui.mainBtn.style.background = '#1677ff';
+    } else if (isPaused) {
+      // resume color same as start to indicate action
+      ui.mainBtn.style.background = '#1677ff';
+    } else {
+      // when running and not paused, show pause color
+      ui.mainBtn.style.background = '#d14343';
+    }
+    // show or hide stop button depending on running state
+    if (ui.stopBtn) {
+      ui.stopBtn.style.display = isRunning ? 'inline-block' : 'none';
+    }
   }
 
   function showProgressPanel() {
@@ -157,6 +170,42 @@
     ui.progressText.textContent = `${safeDone} / ${safeTotal} (${pct}%)`;
   }
 
+  function showToast(message, duration = 3000) {
+    const toast = document.createElement('div');
+    toast.style.cssText = [
+      'position: fixed',
+      'top: 20px',
+      'left: 50%',
+      'transform: translateX(-50%)',
+      'z-index: 1000001',
+      'background: rgba(0,0,0,0.85)',
+      'color: #fff',
+      'padding: 12px 16px',
+      'border-radius: 8px',
+      'font-size: 14px',
+      'word-break: break-all',
+      'max-width: 300px',
+      'box-shadow: 0 2px 8px rgba(0,0,0,0.3)',
+      'animation: fadeIn 0.3s ease-out'
+    ].join(';');
+    toast.textContent = String(message || '');
+    document.body.appendChild(toast);
+
+    // 添加淡入动画样式
+    const style = document.createElement('style');
+    style.textContent = '@keyframes fadeIn { from { opacity: 0; transform: translateX(-50%) translateY(-10px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }';
+    if (!document.querySelector('style[data-toast-anim]')) {
+      style.setAttribute('data-toast-anim', 'true');
+      document.head.appendChild(style);
+    }
+
+    setTimeout(() => {
+      toast.style.animation = 'fadeOut 0.3s ease-in forwards';
+      style.textContent += ' @keyframes fadeOut { from { opacity: 1; transform: translateX(-50%) translateY(0); } to { opacity: 0; transform: translateX(-50%) translateY(-10px); } }';
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
+
   async function waitIfPaused() {
     let wasPaused = false;
     while (isRunning && isPaused && !stopFlag) {
@@ -195,15 +244,42 @@
         stoppedByUser = true;
         return;
       }
+
       currentDirHandle = dirHandle;
-      currentTargetDirHandle = await prepareUserSubDirectory(currentDirHandle, pageInfo.uid);
-      if (!currentTargetDirHandle) {
-        setStatus('无法创建用户子目录');
-        return;
+      
+      let uid = '';
+      // 如果URL中有custom名称，直接使用它作为目录名
+      if (pageInfo.custom) {
+        const dirName = sanitizeDirName(pageInfo.custom);
+        try {
+          currentTargetDirHandle = await currentDirHandle.getDirectoryHandle(dirName, { create: true });
+        } catch (err) {
+          console.error('[weibo-bulk] create user subdir failed:', err);
+          setStatus('无法创建用户子目录');
+          return;
+        }
+        // 仍然需要获取uid来抓取媒体列表
+        uid = await ensureUid(pageInfo);
+        if (!uid) {
+          setStatus('无法识别当前用户 ID，请先打开用户主页后重试');
+          return;
+        }
+      } else {
+        // 否则根据UID获取用户信息来创建目录
+        uid = await ensureUid(pageInfo);
+        if (!uid) {
+          setStatus('无法识别当前用户 ID，请先打开用户主页后重试');
+          return;
+        }
+        currentTargetDirHandle = await prepareUserSubDirectory(currentDirHandle, uid);
+        if (!currentTargetDirHandle) {
+          setStatus('无法创建用户子目录');
+          return;
+        }
       }
 
       setStatus('开始抓取媒体列表...');
-      await produceMediaList(pageInfo.uid);
+      await produceMediaList(uid);
       if (stopFlag) {
         stoppedByUser = true;
         return;
@@ -227,6 +303,11 @@
       }
       maybeResolveFinish();
       await finishPromise;
+
+      // 写入失败任务列表
+      if (failedCount > 0 && currentTargetDirHandle) {
+        await writeFailedTasksFile(currentTargetDirHandle, failedTasks);
+      }
 
       if (stopFlag) {
         stoppedByUser = true;
@@ -254,13 +335,15 @@
 
   function stop() {
     if (!isRunning) return;
-    stopFlag = true;
+    // immediately reflect that we're no longer running so UI resets
+    isRunning = false;
     isPaused = false;
+    stopFlag = true;
     producerDone = true;
     queue.length = 0;
     maybeResolveFinish();
     hideProgressPanel();
-    setStatus('正在停止，完成当前步骤后退出...');
+    setStatus('已停止');
     refreshControlButtons();
   }
 
@@ -273,10 +356,11 @@
   }
 
   function onMainButtonClick() {
-    if (isRunning) {
-      stop();
-    } else {
+    if (!isRunning) {
       run();
+    } else {
+      // when running the main button now toggles pause / continue
+      togglePause();
     }
   }
 
@@ -287,16 +371,38 @@
     } catch (_) {
       return null;
     }
-    const m = u.pathname.match(/^\/u\/(\d+)\/?$/);
-    if (!m) return null;
+    const uidMatch = u.pathname.match(/^\/u\/(\d+)\/?$/);
+    const customMatch = u.pathname.match(/^\/n\/([^/?#]+)\/?$/);
+    if (!uidMatch && !customMatch) return null;
     return {
-      uid: m[1],
+      uid: uidMatch ? uidMatch[1] : '',
+      custom: customMatch ? decodePathSegment(customMatch[1]) : '',
       tabtype: u.searchParams.get('tabtype') || ''
     };
   }
 
   function isAlbumPage(info) {
-    return !!(info && info.uid && info.tabtype === 'album');
+    return !!(info && (info.uid || info.custom) && info.tabtype === 'album');
+  }
+
+  function decodePathSegment(segment) {
+    try {
+      return decodeURIComponent(String(segment || ''));
+    } catch (_) {
+      return String(segment || '');
+    }
+  }
+
+  async function ensureUid(pageInfo) {
+    if (!pageInfo) return '';
+    if (pageInfo.uid) return String(pageInfo.uid);
+    if (!pageInfo.custom) return '';
+    try {
+      const profile = await fetchProfileInfoByCustom(pageInfo.custom);
+      return String((profile && profile.idstr) || (profile && profile.id) || '');
+    } catch (_) {
+      return '';
+    }
   }
 
   function setUiVisible(visible) {
@@ -360,19 +466,22 @@
       'font-size: 12px'
     ].join(';');
 
+    // stop button (hidden until a task is running)
+    const stopBtn = document.createElement('button');
+    stopBtn.textContent = '停止';
+    stopBtn.style.cssText = 'border:0;border-radius:8px;padding:8px 12px;background:#d14343;color:#fff;cursor:pointer;display:none;';
+    stopBtn.addEventListener('click', stop);
+
     const mainBtn = document.createElement('button');
     mainBtn.textContent = '开始下载';
     mainBtn.style.cssText = 'border:0;border-radius:8px;padding:8px 12px;background:#1677ff;color:#fff;cursor:pointer;';
     mainBtn.addEventListener('click', onMainButtonClick);
 
-    const pauseBtn = document.createElement('button');
-    pauseBtn.textContent = '暂停';
-    pauseBtn.disabled = true;
-    pauseBtn.style.cssText = 'border:0;border-radius:8px;padding:8px 12px;background:#444;color:#fff;cursor:pointer;';
-    pauseBtn.addEventListener('click', togglePause);
-
+    // append stop first so main button is on the right side
+    ctrlWrap.appendChild(stopBtn);
     ctrlWrap.appendChild(mainBtn);
-    ctrlWrap.appendChild(pauseBtn);
+    // the returned object includes stopBtn so caller will have reference
+
     document.body.appendChild(ctrlWrap);
 
     const progressWrap = document.createElement('div');
@@ -450,7 +559,7 @@
     expandWrap.appendChild(expandBtn);
     document.body.appendChild(expandWrap);
 
-    return { ctrlWrap, mainBtn, pauseBtn, progressWrap, expandWrap, status, progressBar, progressText };
+    return { ctrlWrap, mainBtn, stopBtn, progressWrap, expandWrap, status, progressBar, progressText };
   }
 
   function getNumberSetting(key, fallback) {
@@ -509,9 +618,9 @@
 
   function isValidIntervalRange(min, max) {
     if (!Number.isFinite(min) || !Number.isFinite(max)) return false;
-    if (min < 100 || max < 100) return false;
+    if (min < 100 || max < 1000) return false;
     if (max <= min) return false;
-    return (max - min) > 3000;
+    return true;
   }
 
   function getDownloadOrder() {
@@ -749,14 +858,14 @@
       const min = Math.floor(Number(minInput.value));
       const max = Math.floor(Number(maxInput.value));
       if (!isValidIntervalRange(min, max)) {
-        error.textContent = '输入不合法：需满足 min>=100 且 max-min>3000';
+        error.textContent = '输入不合法：需满足 min>=100 max>=1000 且 max>min';
         return;
       }
       setNumberSetting(KEY_MIN_INTERVAL, min);
       setNumberSetting(KEY_MAX_INTERVAL, max);
       setStringSetting(KEY_DOWNLOAD_ORDER, orderSelect.value === 'asc' ? 'asc' : 'reverse');
       close();
-      window.alert(`已保存。间隔: ${min}-${max} ms，顺序: ${orderSelect.value === 'asc' ? '顺序' : '倒序'}`);
+      showToast(`已保存。间隔: ${min}-${max} ms，顺序: ${orderSelect.value === 'asc' ? '顺序' : '倒序'}`);
     });
   }
 
@@ -780,18 +889,6 @@
 
   function buildImageUrlWithHost(pid, hostNo) {
     return `https://wx${hostNo}.sinaimg.cn/large/${pid}.jpg`;
-  }
-
-  function normalizeVideoUrl(videoUrl) {
-    if (!videoUrl) return '';
-    try {
-      const u = new URL(videoUrl, window.location.origin);
-      const lp = u.searchParams.get('livephoto');
-      if (lp) return decodeURIComponent(lp);
-      return u.href;
-    } catch (_) {
-      return videoUrl;
-    }
   }
 
   async function produceMediaList(uid) {
@@ -866,6 +963,7 @@
     }
   }
 
+
   async function requestImageWall(uid, sinceId) {
     const url = `https://weibo.com/ajax/profile/getImageWall?uid=${encodeURIComponent(uid)}&sinceid=${encodeURIComponent(String(sinceId))}`;
     const res = await fetch(url, {
@@ -901,7 +999,7 @@
       }
 
       if (item.type === 'livephoto' && item.video) {
-        const videoUrl = normalizeVideoUrl(String(item.video));
+        const videoUrl = String(item.video);
         if (videoUrl) {
           const videoTaskId = `vid:${pid}:${videoUrl}`;
           if (!seen.has(videoTaskId)) {
@@ -1016,6 +1114,11 @@
         }
       } catch (err) {
         failedCount += 1;
+        failedTasks.push({
+          filename: task.filename,
+          url: task.url,
+          error: String(err && err.message ? err.message : err)
+        });
         console.error('[weibo-bulk] download failed:', task.url, err);
       } finally {
         activeDownloads -= 1;
@@ -1098,7 +1201,7 @@
 
   async function ensureDownloadDirHandle(interactive) {
     if (!('showDirectoryPicker' in window)) {
-      window.alert('当前浏览器不支持文件夹模式，请使用支持 File System Access API 的浏览器');
+      showToast('当前浏览器不支持文件夹模式，请使用支持 File System Access API 的浏览器', 5000);
       return null;
     }
 
@@ -1157,6 +1260,41 @@
     }
   }
 
+  async function writeFailedTasksFile(dirHandle, tasks) {
+    if (!tasks || tasks.length === 0) return;
+    
+    try {
+      // 生成文件名：failed_下载_时间戳_随机数.txt
+      const now = new Date();
+      const timestamp = now.getTime();
+      const randNum = Math.floor(Math.random() * 10000);
+      const filename = `failed_${timestamp}_${randNum}.txt`;
+      
+      // 生成文本内容
+      let content = '微博相册批量下载失败列表\n';
+      content += `生成时间：${now.toLocaleString()}\n`;
+      content += `共${tasks.length}个任务失败\n`;
+      content += '='.repeat(80) + '\n\n';
+      
+      for (let i = 0; i < tasks.length; i++) {
+        const task = tasks[i];
+        content += `${i + 1}. ${task.filename || '(未知文件)'}\n`;
+        content += `   URL: ${task.url || '(无URL)'}\n`;
+        content += `   错误: ${task.error || '(无错误信息)'}\n\n`;
+      }
+      
+      // 写入文件
+      const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(content);
+      await writable.close();
+      
+      console.log(`[weibo-bulk] failed tasks list written to ${filename}`);
+    } catch (err) {
+      console.warn('[weibo-bulk] write failed tasks file failed:', err);
+    }
+  }
+
   async function prepareUserSubDirectory(baseDirHandle, uid) {
     const profile = await fetchProfileInfo(uid);
     const screenName = profile && profile.screen_name ? String(profile.screen_name) : '';
@@ -1171,6 +1309,23 @@
 
   async function fetchProfileInfo(uid) {
     const url = `https://weibo.com/ajax/profile/info?uid=${encodeURIComponent(uid)}`;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*' }
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      if (!json || Number(json.ok) !== 1 || !json.data || !json.data.user) return null;
+      return json.data.user;
+    } catch (err) {
+      console.warn('[weibo-bulk] fetch profile info failed:', err);
+      return null;
+    }
+  }
+  async function fetchProfileInfoByCustom(name) {
+    const url = `https://weibo.com/ajax/profile/info?screen_name=${encodeURIComponent(name)}`;
     try {
       const res = await fetch(url, {
         method: 'GET',
