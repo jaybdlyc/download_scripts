@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         一键批量下载微博相册中的全部图片与 LivePhoto 视频
 // @namespace    local.weibo.album.bulk.downloader
-// @version      1.1.1
+// @version      1.1.2
 // @description  一键批量下载微博相册中的全部图片与 LivePhoto 视频（文件夹模式）
 // @match        https://weibo.com/u/*
 // @match        https://weibo.com/n/*
@@ -21,8 +21,8 @@
 (function () {
   'use strict';
 
-  const DEFAULT_MIN_INTERVAL = 1000;
-  const DEFAULT_MAX_INTERVAL = 3000;
+  const DEFAULT_MIN_INTERVAL = 100;
+  const DEFAULT_MAX_INTERVAL = 1000;
   const DOWNLOAD_CONCURRENCY = 4;
   const KEY_MIN_INTERVAL = 'weibo_album_min_interval_ms';
   const KEY_MAX_INTERVAL = 'weibo_album_max_interval_ms';
