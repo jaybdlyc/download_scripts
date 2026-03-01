@@ -1342,6 +1342,24 @@
     }
   }
 
+  async function fetchProfileInfoByCustom(custom) {
+    const url = `https://weibo.com/ajax/profile/info?custom=${encodeURIComponent(custom)}`;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*' }
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      if (!json || Number(json.ok) !== 1 || !json.data || !json.data.user) return null;
+      return json.data.user;
+    } catch (err) {
+      console.warn('[weibo-bulk] fetch profile by custom failed:', err);
+      return null;
+    }
+  }
+
   function sanitizeFileName(name) {
     return String(name || 'file.bin').replace(/[\\/:*?"<>|]/g, '_');
   }
