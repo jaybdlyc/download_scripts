@@ -893,6 +893,8 @@
 
   async function produceMediaList(uid) {
     let sinceId = '0';
+    const allItems = [];
+    // fetch all pages and accumulate items first
     while (true) {
       await waitIfPaused();
       if (stopFlag) break;
@@ -908,8 +910,13 @@
 
       const body = data && data.data ? data.data : {};
       const list = Array.isArray(body.list) ? body.list : [];
-      await enqueueFromList(list);
-      setStatus(`抓取中：已发现 ${discoveredCount} 个文件`);
+      if (list.length) {
+        allItems.push(...list);
+      }
+      // show fetch progress based on raw count
+      setStatus(`抓取中：已发现 ${allItems.length} 个文件`);
+      // temporarily reflect in discoveredCount so progress bar updates
+      discoveredCount = allItems.length;
       updateProgress();
 
       const nextSinceId = String(body.since_id ?? '0');
@@ -918,6 +925,20 @@
       await waitBeforeNextFetch();
       if (stopFlag) break;
     }
+
+    if (stopFlag || allItems.length === 0) {
+      // nothing more to do or stopped by user
+      return;
+    }
+
+    // preprocess timeline information for all items in order; this may call
+    // show API once if the first item lacks both year and month.
+    await preprocessTimeline(allItems);
+
+    // reset discovered count before building actual download queue
+    discoveredCount = 0;
+    // now enqueue every item into task queue using precomputed timeline fields
+    await enqueueFromList(allItems);
   }
 
   async function waitBeforeNextFetch() {
@@ -982,8 +1003,15 @@
       const pid = item.pid ? String(item.pid) : '';
       if (!pid) continue;
       const mid = item.mid ? String(item.mid) : 'nomid';
-      const timeline = await resolveTimeline(item, mid);
-      const baseName = buildBaseFileName(mid, timeline.year, timeline.month, pid);
+
+      // use precomputed timeline values directly, fall back to last known
+      let year = item.timeline_year || lastTimelineYear || 'unknown';
+      let month = item.timeline_month || lastTimelineMonth || 'unknown';
+      if (item.timeline_year && item.timeline_month) {
+        lastTimelineYear = item.timeline_year;
+        lastTimelineMonth = item.timeline_month;
+      }
+      const baseName = buildBaseFileName(mid, year, month, pid);
 
       const imageTaskId = `img:${pid}`;
       if (!seen.has(imageTaskId)) {
@@ -994,7 +1022,7 @@
           pid,
           url: buildImageUrl(pid),
           filename: `${baseName}.jpg`
-        });
+        });   
         discoveredCount += 1;
       }
 
@@ -1018,6 +1046,8 @@
     }
   }
 
+  // legacy resolver kept for compatibility but timeline values are usually
+  // precomputed by preprocessTimeline before enqueueing.
   async function resolveTimeline(item, mid) {
     const yRaw = item.timeline_year == null ? '' : String(item.timeline_year).trim();
     const mRaw = item.timeline_month == null ? '' : String(item.timeline_month).trim();
@@ -1030,7 +1060,7 @@
     if (yRaw) lastTimelineYear = yRaw;
     if (mRaw) lastTimelineMonth = mRaw;
 
-    const needProbe = headTimelineProbeActive && mid && (!yRaw || !mRaw);
+    const needProbe = headTimelineProbeActive && mid && (!yRaw && !mRaw);
     if (needProbe) {
       const created = await fetchStatusCreatedAt(mid);
       const parsed = parseCreatedAtToYearMonth(created);
@@ -1038,6 +1068,7 @@
         lastTimelineYear = parsed.year;
         lastTimelineMonth = parsed.month;
       }
+      headTimelineProbeActive = false;
     }
 
     if (lastTimelineYear && lastTimelineMonth) {
@@ -1051,6 +1082,40 @@
 
   function buildBaseFileName(mid, year, month, pid) {
     return `${mid}_${year}_${month}_${pid}`;
+  }
+
+  // iterate over items in order to fill timeline_year/month fields. the
+  // first item lacking both values will trigger a single call to the show API
+  // (`fetchStatusCreatedAt`) in order to determine the year/month.
+  async function preprocessTimeline(items) {
+    let probeDone = !headTimelineProbeActive;
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const yRaw = item.timeline_year == null ? '' : String(item.timeline_year).trim();
+      const mRaw = item.timeline_month == null ? '' : String(item.timeline_month).trim();
+      if (yRaw && mRaw) {
+        lastTimelineYear = yRaw;
+        lastTimelineMonth = mRaw;
+        probeDone = true;
+        item.timeline_year = yRaw;
+        item.timeline_month = mRaw;
+        continue;
+      }
+      if (yRaw) lastTimelineYear = yRaw;
+      if (mRaw) lastTimelineMonth = mRaw;
+      if (!probeDone && !yRaw && !mRaw && item.mid) {
+        const created = await fetchStatusCreatedAt(item.mid);
+        const parsed = parseCreatedAtToYearMonth(created);
+        if (parsed) {
+          lastTimelineYear = parsed.year;
+          lastTimelineMonth = parsed.month;
+        }
+        probeDone = true;
+      }
+      item.timeline_year = lastTimelineYear || 'unknown';
+      item.timeline_month = lastTimelineMonth || 'unknown';
+    }
+    headTimelineProbeActive = false;
   }
 
   async function fetchStatusCreatedAt(mid) {
